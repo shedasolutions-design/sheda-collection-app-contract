@@ -753,20 +753,39 @@ fn a_commitment_rounding_below_one_share_is_owed_nothing() {
 #[test]
 fn the_shares_in_a_flat_can_never_exceed_what_it_divides_into() {
     // The property that matters. Fill the flat completely across several
-    // investors and the sum of what they are owed must not pass 10,000.
+    // investors and the sum of what they are owed must not pass its
+    // divisor.
+    //
+    // It does not reach it either, and that is correct rather than a
+    // shortfall to fix. Each holder's share is floored, so a flat split
+    // three ways leaves a remainder of up to one share per holder
+    // unissued. Issuing it would mean handing somebody a share nobody
+    // paid for and diluting everyone else by the difference. The same
+    // choice the vault makes with its dust.
     let mut r = raise();
     with_project(&mut r);
     commit(&mut r, "ada.testnet", "1a", 200_000, DAY + 1);
     commit(&mut r, "bode.testnet", "1a", 250_000, DAY + 1);
     commit(&mut r, "chidi.testnet", "1a", 150_000, DAY + 1);
 
-    let total: u128 = ["ada.testnet", "bode.testnet", "chidi.testnet"]
+    let holders = ["ada.testnet", "bode.testnet", "chidi.testnet"];
+    let total: u128 = holders
         .iter()
         .map(|who| r.shares_owed("m120".into(), "1a".into(), acc(who)).0)
         .sum();
+
     assert_eq!(r.get_unit_raised("m120".into(), "1a".into()).0, 600_000);
-    assert!(total <= 10_000, "{} shares owed against 10,000", total);
-    assert_eq!(total, 10_000);
+    assert!(
+        total <= 10_000,
+        "{} shares owed against a divisor of 10,000",
+        total
+    );
+    assert!(
+        10_000 - total < holders.len() as u128,
+        "the unissued remainder is {} against {} holders, which is more than flooring explains",
+        10_000 - total,
+        holders.len()
+    );
 }
 
 #[test]
