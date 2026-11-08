@@ -57,4 +57,12 @@ pub trait RaiseCallbacks {
         amount: U128,
         #[callback_result] result: Result<(), PromiseError>,
     ) -> bool;
+
+    fn on_shares_minted(
+        &mut self,
+        project_id: String,
+        unit: String,
+        who: AccountId,
+        #[callback_result] result: Result<(), PromiseError>,
+    ) -> bool;
 }

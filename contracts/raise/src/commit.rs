@@ -64,18 +64,30 @@ impl Raise {
             return PromiseOrValue::Value(amount);
         }
 
-        // Take only what is still wanted and send the rest straight back.
-        // Accepting an overshoot would leave the extra in escrow with no
-        // phase that ever releases it and no failure that refunds it.
-        let room = project.target.saturating_sub(project.raised);
+        let Some(unit) = project.unit(&parsed.unit) else {
+            env::log_str("rejected: no flat with that code in this raise");
+            return PromiseOrValue::Value(amount);
+        };
+
+        // Take only what is still wanted and send the rest straight back,
+        // bounded by the flat as well as by the raise. Without the first
+        // bound a popular flat oversubscribes, and the shares owed against
+        // it would exceed the shares it divides into.
+        let room = project
+            .target
+            .saturating_sub(project.raised)
+            .min(unit.room());
         if room == 0 {
-            env::log_str("rejected: this raise is already full");
+            env::log_str("rejected: that flat is already fully funded");
             return PromiseOrValue::Value(amount);
         }
         let accepted = amount.0.min(room);
         let returned = amount.0 - accepted;
 
         project.raised += accepted;
+        if let Some(unit) = project.unit_mut(&parsed.unit) {
+            unit.raised += accepted;
+        }
         self.save(&parsed.project, &project);
         self.credit(&parsed.project, &sender_id, &parsed.unit, accepted);
 
@@ -228,20 +240,18 @@ impl Raise {
         false
     }
 
-    /// Turn a commitment into shares in the unit's vault.
+    /// Turn a commitment into shares in the flat's vault.
     ///
-    /// Called once per unit by the investor. The vault must already name
-    /// this contract as its governance, which is set when the vault is
-    /// deployed; without that the mint is refused by the vault rather than
-    /// quietly skipped here.
+    /// Both the share count and the vault come from this contract's own
+    /// state. An earlier version took them as arguments and checked only
+    /// that the caller had committed something, which let anyone who put
+    /// in the smallest possible amount ask for any number of shares they
+    /// liked, diluting every other holder of that flat.
+    ///
+    /// Claimed once. Nothing recorded the claim before, so the same
+    /// commitment could be minted against repeatedly.
     #[payable]
-    pub fn claim_shares(
-        &mut self,
-        project_id: String,
-        unit: String,
-        vault: AccountId,
-        shares: U128,
-    ) -> Promise {
+    pub fn claim_shares(&mut self, project_id: String, unit: String) -> Promise {
         assert_one_yocto();
         let project = self.expect_project(&project_id);
         require!(
@@ -251,11 +261,62 @@ impl Raise {
 
         let who = env::predecessor_account_id();
         let committed = self.commitment_for(&project_id, &who, &unit);
-        require!(committed > 0, "You did not commit to that unit");
+        require!(committed > 0, "You did not commit to that flat");
+        require!(
+            !self.has_claimed(&project_id, &unit, &who),
+            "You have already claimed your shares in that flat"
+        );
+
+        let flat = project
+            .unit(&unit)
+            .unwrap_or_else(|| env::panic_str("No flat with that code in this raise"));
+        let vault = flat
+            .vault
+            .clone()
+            .unwrap_or_else(|| env::panic_str("That flat has no vault yet"));
+
+        let shares = flat.shares_for(committed);
+        require!(shares > 0, "Your commitment rounds to less than one share");
+
+        // Marked before the call. The callback restores it if the mint
+        // fails; the other order leaves a window for a second claim while
+        // the first is still in flight.
+        self.mark_claimed(&project_id, &unit, &who);
+
+        env::log_str(&format!(
+            "shares_claimed {} {} by {} for {}",
+            project_id, unit, who, shares
+        ));
 
         ext_vault::ext(vault)
             .with_attached_deposit(ONE_YOCTO)
             .with_static_gas(GAS_FOR_MINT)
-            .mint_shares(who, shares)
+            .mint_shares(who.clone(), U128(shares))
+            .then(
+                ext_self::ext(env::current_account_id())
+                    .with_static_gas(GAS_FOR_RESOLVE)
+                    .on_shares_minted(project_id, unit, who),
+            )
+    }
+
+    #[private]
+    pub fn on_shares_minted(
+        &mut self,
+        project_id: String,
+        unit: String,
+        who: AccountId,
+        #[callback_result] result: Result<(), PromiseError>,
+    ) -> bool {
+        if result.is_ok() {
+            return true;
+        }
+        // Nothing was minted, so the claim has to come back or the holder
+        // is left with a commitment they can never turn into shares.
+        self.unmark_claimed(&project_id, &unit, &who);
+        env::log_str(&format!(
+            "share mint for {} on {} {} failed and the claim was restored",
+            who, project_id, unit
+        ));
+        false
     }
 }
