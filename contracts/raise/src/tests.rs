@@ -191,25 +191,30 @@ fn money_from_the_wrong_token_is_sent_straight_back() {
 fn an_overshoot_is_taken_only_up_to_the_target() {
     // Accepting more would leave the extra in escrow with no phase that
     // releases it and no failure that refunds it.
+    //
+    // Since the flats have to price up to exactly the target, a flat now
+    // always fills before the raise does, so this is the per-flat bound
+    // doing the work. The project bound behind it is defensive and no
+    // longer the one that binds first.
     let mut r = raise();
     with_project(&mut r);
-    commit(&mut r, "ada.testnet", "1a", 900_000, DAY + 1);
+    commit(&mut r, "ada.testnet", "1a", 600_000, DAY + 1);
 
     ctx("usdt.testnet", 0, DAY + 1);
     let change = r.ft_on_transfer(
         acc("bode.testnet"),
-        U128(300_000),
+        U128(500_000),
         r#"{"project":"m120","unit":"1b"}"#.into(),
     );
     match change {
-        near_sdk::PromiseOrValue::Value(v) => assert_eq!(v.0, 200_000),
+        near_sdk::PromiseOrValue::Value(v) => assert_eq!(v.0, 100_000, "1b only holds 400,000"),
         _ => panic!("expected the overshoot back"),
     }
     let p = r.get_project("m120".into()).unwrap();
-    assert_eq!(p.raised.0, 1_000_000);
+    assert_eq!(p.raised.0, 1_000_000, "both flats full is the target");
     assert_eq!(
         r.get_total_commitment("m120".into(), acc("bode.testnet")).0,
-        100_000
+        400_000
     );
 }
 
@@ -396,11 +401,13 @@ fn enough_objections_hold_the_payment() {
 
 #[test]
 fn an_objection_below_the_threshold_does_not_hold_the_payment() {
-    // Bode has 400,000 of 1,000,000, which is 40%. Make it someone small
-    // instead: a 10% objection should not stop a release.
+    // Three investors so one of them is genuinely small: ada takes the
+    // whole of 1a, bode most of 1b, and small the remaining tenth of the
+    // raise. A 10% objection should not stop a release.
     let mut r = raise();
     with_project(&mut r);
-    commit(&mut r, "ada.testnet", "1a", 900_000, DAY + 1);
+    commit(&mut r, "ada.testnet", "1a", 600_000, DAY + 1);
+    commit(&mut r, "bode.testnet", "1b", 300_000, DAY + 1);
     commit(&mut r, "small.testnet", "1b", 100_000, DAY + 1);
     ctx("anyone.testnet", 0, DAY + 2);
     r.close_raise("m120".into());
