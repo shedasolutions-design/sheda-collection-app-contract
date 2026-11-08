@@ -51,6 +51,11 @@ fn with_project(r: &mut Raise) {
             ("Roofing".into(), 2_500),
             ("Handover".into(), 2_500),
         ],
+        // Two flats adding up to the target.
+        vec![
+            ("1a".into(), U128(600_000), U128(10_000)),
+            ("1b".into(), U128(400_000), U128(10_000)),
+        ],
     );
 }
 
@@ -88,6 +93,7 @@ fn a_schedule_that_does_not_release_everything_is_refused() {
         0,
         0,
         vec![("Foundation".into(), 6_000)],
+        vec![("a".into(), U128(1_000), U128(10_000))],
     );
 }
 
@@ -106,6 +112,7 @@ fn a_builder_cannot_inspect_their_own_work() {
         0,
         0,
         vec![("All".into(), 10_000)],
+        vec![("a".into(), U128(1_000), U128(10_000))],
     );
 }
 
@@ -126,6 +133,7 @@ fn the_platform_fee_has_a_ceiling_in_the_contract() {
         9_000,
         0,
         vec![("All".into(), 10_000)],
+        vec![("a".into(), U128(1_000), U128(10_000))],
     );
 }
 
@@ -621,4 +629,198 @@ fn phases_are_reported_in_the_order_they_run() {
         .map(|p: &Phase| p.name.clone())
         .collect();
     assert_eq!(names, vec!["Foundation", "Frame", "Roofing", "Handover"]);
+}
+
+// ---- flats and shares -----------------------------------------------------
+
+#[test]
+#[should_panic(expected = "add up to exactly the target")]
+fn flats_priced_below_the_target_are_refused() {
+    // A raise whose flats cannot absorb the target can never fill, and
+    // the shortfall only shows up once the last flat is taken.
+    let mut r = raise();
+    ctx("sheda.testnet", 0, DAY);
+    r.create_project(
+        "short".into(),
+        acc("builder.testnet"),
+        acc("manager.testnet"),
+        acc("usdt.testnet"),
+        U128(1_000_000),
+        U64(DAY * 2),
+        0,
+        0,
+        vec![("All".into(), 10_000)],
+        vec![("1a".into(), U128(600_000), U128(10_000))],
+    );
+}
+
+#[test]
+#[should_panic(expected = "share a code")]
+fn two_flats_cannot_share_a_code() {
+    // A commitment names the flat by code, so a duplicate makes it
+    // ambiguous, and the ambiguity surfaces only when shares are claimed.
+    let mut r = raise();
+    ctx("sheda.testnet", 0, DAY);
+    r.create_project(
+        "dupe".into(),
+        acc("builder.testnet"),
+        acc("manager.testnet"),
+        acc("usdt.testnet"),
+        U128(1_000_000),
+        U64(DAY * 2),
+        0,
+        0,
+        vec![("All".into(), 10_000)],
+        vec![
+            ("1a".into(), U128(500_000), U128(10_000)),
+            ("1a".into(), U128(500_000), U128(10_000)),
+        ],
+    );
+}
+
+#[test]
+fn a_commitment_is_capped_by_the_flat_and_not_only_by_the_raise() {
+    // Unit 1a is priced at 600,000 inside a 1,000,000 raise. Without the
+    // per-flat bound this would take 900,000 and owe more shares than the
+    // flat divides into.
+    let mut r = raise();
+    with_project(&mut r);
+
+    ctx("usdt.testnet", 0, DAY + 1);
+    let change = r.ft_on_transfer(
+        acc("ada.testnet"),
+        U128(900_000),
+        r#"{"project":"m120","unit":"1a"}"#.into(),
+    );
+    match change {
+        near_sdk::PromiseOrValue::Value(v) => assert_eq!(v.0, 300_000, "the overshoot comes back"),
+        _ => panic!("expected change"),
+    }
+    assert_eq!(r.get_unit_raised("m120".into(), "1a".into()).0, 600_000);
+}
+
+#[test]
+fn money_aimed_at_a_flat_that_does_not_exist_is_refused() {
+    let mut r = raise();
+    with_project(&mut r);
+    ctx("usdt.testnet", 0, DAY + 1);
+    let back = r.ft_on_transfer(
+        acc("ada.testnet"),
+        U128(1_000),
+        r#"{"project":"m120","unit":"penthouse"}"#.into(),
+    );
+    match back {
+        near_sdk::PromiseOrValue::Value(v) => assert_eq!(v.0, 1_000),
+        _ => panic!("expected a refusal"),
+    }
+}
+
+#[test]
+fn shares_are_derived_from_what_was_committed() {
+    // 150,000 into a flat priced at 600,000 that divides into 10,000
+    // shares is a quarter of it, so 2,500 shares.
+    let mut r = raise();
+    with_project(&mut r);
+    commit(&mut r, "ada.testnet", "1a", 150_000, DAY + 1);
+    assert_eq!(
+        r.shares_owed("m120".into(), "1a".into(), acc("ada.testnet"))
+            .0,
+        2_500
+    );
+}
+
+#[test]
+fn a_commitment_rounding_below_one_share_is_owed_nothing() {
+    // 59 of a 600,000 flat divided into 10,000 shares is 0.00098 of a
+    // share. Rounding that up would hand out a share nobody paid for.
+    let mut r = raise();
+    with_project(&mut r);
+    commit(&mut r, "ada.testnet", "1a", 59, DAY + 1);
+    assert_eq!(
+        r.shares_owed("m120".into(), "1a".into(), acc("ada.testnet"))
+            .0,
+        0
+    );
+}
+
+#[test]
+fn the_shares_in_a_flat_can_never_exceed_what_it_divides_into() {
+    // The property that matters. Fill the flat completely across several
+    // investors and the sum of what they are owed must not pass 10,000.
+    let mut r = raise();
+    with_project(&mut r);
+    commit(&mut r, "ada.testnet", "1a", 200_000, DAY + 1);
+    commit(&mut r, "bode.testnet", "1a", 250_000, DAY + 1);
+    commit(&mut r, "chidi.testnet", "1a", 150_000, DAY + 1);
+
+    let total: u128 = ["ada.testnet", "bode.testnet", "chidi.testnet"]
+        .iter()
+        .map(|who| r.shares_owed("m120".into(), "1a".into(), acc(who)).0)
+        .sum();
+    assert_eq!(r.get_unit_raised("m120".into(), "1a".into()).0, 600_000);
+    assert!(total <= 10_000, "{} shares owed against 10,000", total);
+    assert_eq!(total, 10_000);
+}
+
+#[test]
+#[should_panic(expected = "no vault yet")]
+fn shares_cannot_be_claimed_before_a_vault_exists() {
+    let mut r = raise();
+    fund(&mut r);
+    ctx("ada.testnet", 1, DAY + 3);
+    let _ = r.claim_shares("m120".into(), "1a".into());
+}
+
+#[test]
+#[should_panic(expected = "Only Sheda")]
+fn a_builder_cannot_point_a_flat_at_a_vault_of_their_choosing() {
+    // The account claim_shares mints against. A builder able to set it
+    // could have shares minted on a contract they control.
+    let mut r = raise();
+    with_project(&mut r);
+    ctx("builder.testnet", 1, DAY + 1);
+    r.set_unit_vault("m120".into(), "1a".into(), acc("evil.testnet"));
+}
+
+#[test]
+#[should_panic(expected = "already has a vault")]
+fn a_flats_vault_cannot_be_moved_once_set() {
+    // Moving it would strand every share already minted at the old one.
+    let mut r = raise();
+    with_project(&mut r);
+    ctx("sheda.testnet", 1, DAY + 1);
+    r.set_unit_vault("m120".into(), "1a".into(), acc("v1.testnet"));
+    ctx("sheda.testnet", 1, DAY + 2);
+    r.set_unit_vault("m120".into(), "1a".into(), acc("v2.testnet"));
+}
+
+#[test]
+fn claiming_twice_is_refused() {
+    // Nothing recorded the claim before, so the same commitment could be
+    // minted against over and over.
+    let mut r = raise();
+    fund(&mut r);
+    ctx("sheda.testnet", 1, DAY + 3);
+    r.set_unit_vault("m120".into(), "1a".into(), acc("vault1a.testnet"));
+
+    ctx("ada.testnet", 1, DAY + 4);
+    let _ = r.claim_shares("m120".into(), "1a".into());
+    // The claim is marked before the mint is sent, so a second call while
+    // the first is still in flight finds it already taken.
+    assert_eq!(
+        r.shares_owed("m120".into(), "1a".into(), acc("ada.testnet"))
+            .0,
+        0
+    );
+}
+
+#[test]
+#[should_panic(expected = "did not commit")]
+fn someone_who_committed_nothing_cannot_claim() {
+    let mut r = raise();
+    fund(&mut r);
+    ctx("sheda.testnet", 1, DAY + 3);
+    r.set_unit_vault("m120".into(), "1a".into(), acc("vault1a.testnet"));
+    ctx("passerby.testnet", 1, DAY + 4);
+    let _ = r.claim_shares("m120".into(), "1a".into());
 }

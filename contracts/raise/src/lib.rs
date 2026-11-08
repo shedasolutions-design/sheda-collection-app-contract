@@ -70,6 +70,7 @@ enum StorageKey {
     ByUnit,
     Objected,
     OptedOut,
+    Claimed,
 }
 
 /// Where a raise is in its life.
@@ -131,6 +132,46 @@ pub struct Phase {
     pub objection_amount: u128,
 }
 
+/// One flat inside a raise.
+///
+/// Held here rather than only in the backend because the share count an
+/// investor is owed is computed from the price and the divisor, and a
+/// figure that decides ownership cannot come from the caller asking for it.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub struct Unit {
+    pub code: String,
+    /// Price of the whole flat, atomic units.
+    pub price: u128,
+    /// How many shares it divides into.
+    pub total_shares: u128,
+    /// Committed to this unit so far.
+    pub raised: u128,
+    /// The vault that owns it. Absent until one is deployed, and shares
+    /// cannot be claimed before then because there is nowhere to mint them.
+    pub vault: Option<AccountId>,
+}
+
+impl Unit {
+    /// What a commitment buys, rounded down.
+    ///
+    /// Down, never nearest: rounding up hands out a share the raise never
+    /// received the money for, and every other holder's slice of that
+    /// flat's rent shrinks by a fraction nobody can account for.
+    pub fn shares_for(&self, committed: u128) -> u128 {
+        if self.price == 0 {
+            return 0;
+        }
+        committed * self.total_shares / self.price
+    }
+
+    /// What is still available in this flat.
+    pub fn room(&self) -> u128 {
+        self.price.saturating_sub(self.raised)
+    }
+}
+
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
 #[borsh(crate = "near_sdk::borsh")]
 #[serde(crate = "near_sdk::serde")]
@@ -152,6 +193,8 @@ pub struct Project {
     pub deadline_ns: u64,
     pub status: RaiseStatus,
     pub phases: Vec<Phase>,
+    /// The flats this raise divides into.
+    pub units: Vec<Unit>,
     /// Sheda's cut of a completed raise. Charged once, on funding.
     pub platform_bps: u32,
     /// Cover the builder advertised, as a proportion of the target. It is
@@ -196,6 +239,14 @@ impl Project {
             .unwrap_or(0)
     }
 
+    pub fn unit(&self, code: &str) -> Option<&Unit> {
+        self.units.iter().find(|u| u.code == code)
+    }
+
+    pub fn unit_mut(&mut self, code: &str) -> Option<&mut Unit> {
+        self.units.iter_mut().find(|u| u.code == code)
+    }
+
     pub fn is_live(&self) -> bool {
         matches!(self.status, RaiseStatus::Open | RaiseStatus::Funded)
     }
@@ -222,6 +273,8 @@ pub struct Raise {
     objected: LookupMap<String, bool>,
     /// "{project}|{investor}" -> has already taken their money back.
     opted_out: LookupMap<String, bool>,
+    /// "{project}|{unit}|{investor}" -> shares already minted.
+    claimed: LookupMap<String, bool>,
 }
 
 #[near]
@@ -238,6 +291,7 @@ impl Raise {
             by_unit: LookupMap::new(StorageKey::ByUnit),
             objected: LookupMap::new(StorageKey::Objected),
             opted_out: LookupMap::new(StorageKey::OptedOut),
+            claimed: LookupMap::new(StorageKey::Claimed),
         }
     }
 
@@ -262,6 +316,7 @@ impl Raise {
         platform_bps: u32,
         guarantee_bps: u32,
         phases: Vec<(String, u32)>,
+        units: Vec<(String, U128, U128)>,
     ) {
         self.assert_owner();
         require!(
@@ -293,6 +348,44 @@ impl Raise {
         require!(
             u128::from(total) == BPS,
             "The phase schedule must release exactly the whole raise"
+        );
+
+        require!(!units.is_empty(), "A raise needs at least one flat in it");
+        let built_units: Vec<Unit> = units
+            .into_iter()
+            .map(|(code, price, total_shares)| {
+                require!(!code.is_empty(), "A flat needs a code");
+                require!(price.0 > 0, "A flat needs a price above zero");
+                require!(
+                    total_shares.0 > 0,
+                    "A flat has to divide into at least one share"
+                );
+                Unit {
+                    code,
+                    price: price.0,
+                    total_shares: total_shares.0,
+                    raised: 0,
+                    vault: None,
+                }
+            })
+            .collect();
+
+        // Two flats sharing a code would make a commitment ambiguous, and
+        // the ambiguity would only surface when somebody claimed shares.
+        for (i, unit) in built_units.iter().enumerate() {
+            require!(
+                !built_units[..i].iter().any(|u| u.code == unit.code),
+                "Two flats in this raise share a code"
+            );
+        }
+
+        // The flats have to account for the target. Priced below it, the
+        // raise can never fill; above it, the last people to commit are
+        // turned away from flats that were still open.
+        let priced: u128 = built_units.iter().map(|u| u.price).sum();
+        require!(
+            priced == target.0,
+            "The flats have to add up to exactly the target"
         );
 
         let built = phases
@@ -327,6 +420,7 @@ impl Raise {
                 deadline_ns: deadline_ns.0,
                 status: RaiseStatus::Open,
                 phases: built,
+                units: built_units,
                 platform_bps,
                 guarantee_bps,
             },
@@ -352,6 +446,7 @@ impl Raise {
             platform_bps: p.platform_bps,
             guarantee_bps: p.guarantee_bps,
             phases: p.phases.clone(),
+            units: p.units.clone(),
         })
     }
 
@@ -429,6 +524,51 @@ impl Raise {
         self.stake_registry = stake_registry;
     }
 
+    /// Record where a flat's vault was deployed.
+    ///
+    /// Owner only, and set once. This is the account `claim_shares` will
+    /// mint against, so a builder able to point it anywhere could have
+    /// shares minted on a contract of their choosing. Deploying the vault
+    /// itself happens outside: a factory would mean carrying the vault
+    /// wasm in this contract's state, and getting the governance wiring
+    /// right matters more than where the deploy is driven from.
+    #[payable]
+    pub fn set_unit_vault(&mut self, project_id: String, unit_code: String, vault: AccountId) {
+        assert_one_yocto();
+        self.assert_owner();
+        let mut project = self.expect_project(&project_id);
+        {
+            let flat = project
+                .unit_mut(&unit_code)
+                .unwrap_or_else(|| env::panic_str("No flat with that code in this raise"));
+            require!(
+                flat.vault.is_none(),
+                "That flat already has a vault, and moving it would strand the shares already minted"
+            );
+            flat.vault = Some(vault.clone());
+        }
+        self.save(&project_id, &project);
+        env::log_str(&format!("vault_set {} {} {}", project_id, unit_code, vault));
+    }
+
+    /// What one investor is owed in a flat, before they claim it.
+    ///
+    /// A view so somebody can see the figure without signing anything,
+    /// and so the app shows the same number the contract would mint.
+    pub fn shares_owed(&self, project_id: String, unit: String, account_id: AccountId) -> U128 {
+        let Some(project) = self.projects_get(&project_id) else {
+            return U128(0);
+        };
+        if self.has_claimed(&project_id, &unit, &account_id) {
+            return U128(0);
+        }
+        let committed = self.commitment_for(&project_id, &account_id, &unit);
+        match project.unit(&unit) {
+            Some(flat) => U128(flat.shares_for(committed)),
+            None => U128(0),
+        }
+    }
+
     #[payable]
     pub fn set_treasury(&mut self, treasury: AccountId) {
         assert_one_yocto();
@@ -491,6 +631,21 @@ impl Raise {
 
     pub(crate) fn unmark_opted_out(&mut self, project_id: &str, who: &AccountId) {
         self.opted_out.remove(&Self::investor_key(project_id, who));
+    }
+
+    pub(crate) fn has_claimed(&self, project_id: &str, unit: &str, who: &AccountId) -> bool {
+        self.claimed
+            .get(&Self::unit_key(project_id, who, unit))
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn mark_claimed(&mut self, project_id: &str, unit: &str, who: &AccountId) {
+        self.claimed
+            .insert(&Self::unit_key(project_id, who, unit), &true);
+    }
+
+    pub(crate) fn unmark_claimed(&mut self, project_id: &str, unit: &str, who: &AccountId) {
+        self.claimed.remove(&Self::unit_key(project_id, who, unit));
     }
 
     /// A project, or nothing. Used where a miss is an answer rather than a
@@ -566,4 +721,5 @@ pub struct ProjectView {
     pub platform_bps: u32,
     pub guarantee_bps: u32,
     pub phases: Vec<Phase>,
+    pub units: Vec<Unit>,
 }
